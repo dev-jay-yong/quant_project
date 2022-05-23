@@ -1,0 +1,3 @@
+app/config.py
+.idea
+app/__pycache__/
