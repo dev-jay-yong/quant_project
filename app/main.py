@@ -10,22 +10,19 @@ from config import Config
 # data = pyupbit.get_ohlcv(ticker="KRW-BTC", interval="minute1", count=500, to=None, period=0.1) # 데이터 가져오기
 # pyupbit.get_current_price(ticker="KRW-BTC") # 현재가 조회
 
-
 class AutoTrading:
     def __init__(self):
         self.upbit = None
         self.config = Config()
-        self.reset_setting()
-        self.fail_list = []
-
-    def reset_setting(self):
         self.shopping_basket = []
         self.total_score = 0
-        self.target_ticker = None
-        self.is_buy = False
-        self.target_ticker_buy_price = 0
-        self.min_ratio = -5
-        self.max_ratio = 5
+        self.target_ticker = []
+        self.buy_ticker = []
+        self.target_ticker_buy_price = {}
+        self.min_ratio = {}
+        self.max_ratio = {}
+        self.fail_list = []
+        self.worker_count = 3
 
     def send_slack(self, text):
         url = self.config.slack_channel
@@ -71,6 +68,8 @@ class AutoTrading:
         return pyupbit.get_orderbook(ticker=ticker)["orderbook_units"][0]["ask_price"]
 
     def select_best_ticker(self):
+        score_dict = {}
+
         for ticker in self.shopping_basket:
             data = pyupbit.get_ohlcv(ticker=ticker, interval="minute1", count=500, to=None, period=0.1)
             first_data = data.iloc[0]
@@ -91,47 +90,71 @@ class AutoTrading:
 
             total_score = (open_price_score * 10000) + volume_score
 
-            if total_score > self.total_score:
-                self.target_ticker = ticker
-                self.total_score = total_score
+            if total_score < 5000:
+                continue
 
-        self.send_slack(f'상승 예측 ticker - {self.shopping_basket}\n구매 예정 ticker - {self.target_ticker} | '
-                        f'score : {self.total_score}')
+            score_dict[ticker] = total_score
+
+        score_dict = sorted(score_dict.items(), key = lambda item: item[1], reverse=True)
+
+        for i in range(0, min(len(score_dict), self.worker_count)):
+            if score_dict[i][0] in self.buy_ticker:
+                continue
+            self.target_ticker.append(score_dict[i][0])
+
+        if self.target_ticker:
+            self.send_slack(f'상승 예측 ticker - {self.shopping_basket}\n구매 예정 ticker - {self.target_ticker} | '
+                            f'score : {self.total_score}')
         self.shopping_basket = []
 
     def buy_target_ticker(self):
-        krw = self.get_balance("KRW")
+        for ticker in self.target_ticker:
+            if ticker in self.buy_ticker:
+                continue
 
-        buy_result = self.upbit.buy_market_order(self.target_ticker, krw * 0.9995)
-
-        self.send_slack(f'구매 ticker - {self.target_ticker} | 구매정보 : {buy_result}')
-
-        self.target_ticker_buy_price = self.get_current_price(self.target_ticker)
-        self.is_buy = True
+            krw = self.get_balance("KRW") / self.worker_count
+            buy_result = self.upbit.buy_market_order(ticker, krw * 0.9995)
+            self.send_slack(f'구매 ticker - {ticker} | 구매정보 : {buy_result}')
+            self.target_ticker_buy_price[ticker] = self.get_current_price(ticker)
+            self.buy_ticker.append(ticker)
+            self.worker_count -= 1
 
     def sell_target_ticker(self):
-        current_price = self.get_current_price(self.target_ticker)
-        rate_ratio = (current_price - self.target_ticker_buy_price) / self.target_ticker_buy_price * 100
-        btc = self.get_balance(self.target_ticker.replace("KRW-", ""))
+        remove_ticker_list = []
+        for ticker in self.target_ticker:
+            current_price = self.get_current_price(ticker)
+            rate_ratio = (current_price - self.target_ticker_buy_price[ticker]) / self.target_ticker_buy_price[ticker] * 100
+            coin_valume = self.get_balance(ticker.replace("KRW-", ""))
 
-        if rate_ratio < self.min_ratio:
-            if rate_ratio < 0:
-                self.fail_list.append(self.target_ticker)
-                self.send_slack(f'{self.target_ticker} 손절 | 손절금 : {btc} | 손실률 : {rate_ratio}')
-            else:
-                self.send_slack(f'{self.target_ticker} 익절 | 익절금 : {btc} | 수익률 : {rate_ratio}')
+            if rate_ratio < self.min_ratio.get(ticker, -5):
+                if rate_ratio < 0:
+                    self.fail_list.append(ticker)
+                    self.send_slack(f'{ticker} 손절 | 손절금 : {coin_valume} | 손실률 : {rate_ratio}')
+                else:
+                    self.send_slack(f'{ticker} 익절 | 익절금 : {coin_valume} | 수익률 : {rate_ratio}')
 
-            self.upbit.sell_market_order(self.target_ticker, btc)
-            self.reset_setting()
+                self.upbit.sell_market_order(ticker, coin_valume)
+                self.worker_count += 1
+                self.min_ratio.pop(ticker, None)
+                self.max_ratio.pop(ticker, None)
+                self.buy_ticker.remove(ticker)
+                remove_ticker_list.append(ticker)
 
-        if rate_ratio >= self.max_ratio:
-            auto_trading_class.send_slack(f'{self.target_ticker}의 현재 수익률 : {rate_ratio} | 목표 수익률 : {self.max_ratio}, 손절 예정금 : {self.min_ratio}')
-            self.min_ratio += 5
-            self.max_ratio += 5
-        if rate_ratio >= 15:
-            self.send_slack(f'{self.target_ticker} 익절 | 익절금 : {btc} | 수익률 : {rate_ratio}')
-            self.upbit.sell_market_order(self.target_ticker, btc)
-            self.reset_setting()
+            if rate_ratio >= self.max_ratio.get(ticker, 5):
+                auto_trading_class.send_slack(f'{ticker}의 현재 수익률 : {rate_ratio} | 목표 수익률 : {self.max_ratio.get(ticker, 5)}, 손절 예정금 : {self.min_ratio.get(ticker, 0)}')
+                self.min_ratio[ticker] = self.min_ratio.get(ticker, 0) + 5
+                self.max_ratio[ticker] = self.max_ratio.get(ticker, 5) + 5
+            if rate_ratio >= 20:
+                self.send_slack(f'{ticker} 익절 | 익절금 : {coin_valume} | 수익률 : {rate_ratio}')
+                self.upbit.sell_market_order(self.target_ticker, coin_valume)
+                self.worker_count += 1
+                self.min_ratio.pop(ticker, None)
+                self.max_ratio.pop(ticker, None)
+                self.buy_ticker.remove(ticker)
+                remove_ticker_list.append(ticker)
+
+        for remove_ticker in remove_ticker_list:
+            self.target_ticker.remove(remove_ticker)
 
 
 auto_trading_class = AutoTrading()
@@ -140,8 +163,11 @@ auto_trading_class.send_slack(f'자동매매 시작 일시 - {datetime.datetime.
 auto_trading_class.send_slack(f'자동매매 대상 리스트 - {auto_trading_class.config.target_ticker_list}')
 
 while True:
-    if auto_trading_class.is_buy is False:
+    if auto_trading_class.worker_count:
         for target_ticker in auto_trading_class.config.target_ticker_list:
+            if target_ticker in auto_trading_class.target_ticker:
+                continue
+
             if target_ticker in auto_trading_class.fail_list:
                 continue
 
@@ -158,14 +184,11 @@ while True:
                 time.sleep(1)
             except Exception as e:
                 auto_trading_class.send_slack(f"에러 발생 - {e}")
-                print(e)
 
         if auto_trading_class.shopping_basket:
             auto_trading_class.select_best_ticker()
             auto_trading_class.buy_target_ticker()
 
-
-        # auto_trading_class.post_message(myToken,"#crypto", "BTC buy : " +str(buy_result))
     else:
         auto_trading_class.sell_target_ticker()
         time.sleep(5)
